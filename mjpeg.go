@@ -45,6 +45,7 @@ package mjpeg
 import (
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"os"
@@ -58,7 +59,50 @@ var (
 
 	// errImproperUse signals improper state (due to a previous error).
 	errImproperState = errors.New("Improper State")
+
+	// ErrCorruptFrame reports that a frame is not a well-formed JPEG image
+	// (e.g. missing SOI marker, truncated or malformed segments,
+	// or no frame header before the entropy-coded data).
+	ErrCorruptFrame = errors.New("Corrupt JPEG frame")
+
+	// ErrUnsupportedSampling reports that a frame uses a color / sampling
+	// format MJPEG players in general cannot decode. Only 3-component
+	// (YCbCr) frames are supported, with the luma component sampled at
+	// most 2x2 and the chroma components sampled 1x1
+	// (i.e. 4:4:4, 4:2:2 and 4:2:0). Grayscale (1 component), CMYK
+	// (4 components) and exotic subsamplings are rejected.
+	ErrUnsupportedSampling = errors.New("Unsupported JPEG sampling")
+
+	// ErrFrameSizeMismatch reports that a frame's pixel dimensions differ
+	// from the video dimensions passed to New().
+	ErrFrameSizeMismatch = errors.New("Frame size differs from video size")
 )
+
+// FrameError describes a frame rejected by AviWriter.AddFrame().
+// The frame is not added to the video and the writer remains usable.
+type FrameError struct {
+	// Frame is the 0-based index of the rejected frame, i.e. the number of
+	// frames successfully added so far.
+	Frame int
+	// Err is the classification of the failure: one of ErrCorruptFrame,
+	// ErrUnsupportedSampling or ErrFrameSizeMismatch.
+	Err error
+	// Detail optionally holds a human-readable description of the
+	// offending frame parameter (e.g. the actual size or sampling).
+	Detail string
+}
+
+// Error implements error.
+func (e *FrameError) Error() string {
+	if e.Detail != "" {
+		return fmt.Sprintf("mjpeg: frame %d: %v: %s", e.Frame, e.Err, e.Detail)
+	}
+	return fmt.Sprintf("mjpeg: frame %d: %v", e.Frame, e.Err)
+}
+
+// Unwrap returns the classification of the failure, so callers may use
+// errors.Is(err, mjpeg.ErrCorruptFrame) etc.
+func (e *FrameError) Unwrap() error { return e.Err }
 
 // AviWriter is an *.avi video writer.
 // The video codec is MJPEG.
@@ -331,7 +375,17 @@ func (aw *aviWriter) currentPos() int64 {
 // AddFrame implements AviWriter.AddFrame().
 // ErrTooLarge is returned if the vide file is too large and would get corrupted
 // if the given image would be added. The file limit is about 4GB.
+//
+// Each frame is validated before it is written. If the JPEG data is corrupt,
+// uses an unsupported sampling (e.g. grayscale or CMYK), or its dimensions
+// differ from the video dimensions, a *FrameError classifying the failure
+// (and carrying the frame index) is returned, the frame is not added and
+// the writer remains usable.
 func (aw *aviWriter) AddFrame(jpegData []byte) error {
+	if err := aw.validateFrame(jpegData); err != nil {
+		return err
+	}
+
 	framePos := aw.currentPos()
 	// Pointers in AVI are 32 bit. Do not write beyond that else the whole AVI file will be corrupted (not playable).
 	// Index entry size: 16 bytes (for each frame)
@@ -355,6 +409,127 @@ func (aw *aviWriter) AddFrame(jpegData []byte) error {
 	aw.writeIdxInt32(int32(len(jpegData)))         // length of the chunk
 
 	return aw.err
+}
+
+// sofInfo holds the frame parameters parsed from a JPEG SOF marker segment.
+type sofInfo struct {
+	width, height int
+	// compSamp holds the (horizontal, vertical) sampling factor of each
+	// color component, in the order they appear in the frame header.
+	compSamp [][2]int
+}
+
+// scanJPEGSOF scans the JPEG marker segments of data and returns the
+// parameters from the first SOF (start of frame) segment.
+// It returns an error if data is not a well-formed JPEG stream up to and
+// including the frame header.
+func scanJPEGSOF(data []byte) (*sofInfo, error) {
+	if len(data) < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+		return nil, errors.New("missing SOI marker")
+	}
+	pos := 2
+	for {
+		// A marker is a 0xFF byte (possibly preceded by 0xFF fill bytes)
+		// followed by a non-zero marker code.
+		if pos >= len(data) || data[pos] != 0xFF {
+			return nil, errors.New("expected marker")
+		}
+		for pos < len(data) && data[pos] == 0xFF {
+			pos++
+		}
+		if pos >= len(data) {
+			return nil, errors.New("truncated marker")
+		}
+		marker := data[pos]
+		pos++
+		if marker == 0x00 {
+			return nil, errors.New("stuffed byte outside entropy-coded data")
+		}
+		if marker == 0x01 || marker == 0xD8 || (marker >= 0xD0 && marker <= 0xD7) {
+			continue // TEM, SOI, RSTn: markers without a length field
+		}
+		if marker == 0xD9 {
+			return nil, errors.New("EOI before frame header")
+		}
+		if marker == 0xDA {
+			return nil, errors.New("scan data before frame header")
+		}
+		if pos+2 > len(data) {
+			return nil, errors.New("truncated segment length")
+		}
+		segLen := int(data[pos])<<8 | int(data[pos+1])
+		if segLen < 2 || pos+segLen > len(data) {
+			return nil, errors.New("invalid segment length")
+		}
+		// SOFn markers: C0-CF except DHT (C4), JPG (C8) and DAC (CC).
+		isSOF := marker >= 0xC0 && marker <= 0xCF &&
+			marker != 0xC4 && marker != 0xC8 && marker != 0xCC
+		if !isSOF {
+			pos += segLen
+			continue
+		}
+		if segLen < 8 {
+			return nil, errors.New("short frame header")
+		}
+		seg := data[pos+2 : pos+segLen]
+		height := int(seg[1])<<8 | int(seg[2])
+		width := int(seg[3])<<8 | int(seg[4])
+		numComp := int(seg[5])
+		if width == 0 || height == 0 {
+			return nil, errors.New("zero frame dimension")
+		}
+		if numComp == 0 || segLen < 6+3*numComp {
+			return nil, errors.New("invalid component count")
+		}
+		info := &sofInfo{width: width, height: height, compSamp: make([][2]int, numComp)}
+		for i := 0; i < numComp; i++ {
+			s := seg[6+3*i+1]
+			info.compSamp[i] = [2]int{int(s >> 4), int(s & 0x0F)}
+		}
+		return info, nil
+	}
+}
+
+// validateFrame checks that jpegData is a well-formed JPEG frame whose
+// format is supported by MJPEG and whose dimensions match the video.
+// It returns a *FrameError classifying the failure, or nil if the frame
+// may be added.
+func (aw *aviWriter) validateFrame(jpegData []byte) error {
+	info, err := scanJPEGSOF(jpegData)
+	if err != nil {
+		return &FrameError{Frame: aw.frames, Err: ErrCorruptFrame, Detail: err.Error()}
+	}
+	if info.width != int(aw.width) || info.height != int(aw.height) {
+		return &FrameError{
+			Frame: aw.frames,
+			Err:   ErrFrameSizeMismatch,
+			Detail: fmt.Sprintf("frame is %dx%d, video is %dx%d",
+				info.width, info.height, aw.width, aw.height),
+		}
+	}
+	if len(info.compSamp) != 3 {
+		return &FrameError{
+			Frame:  aw.frames,
+			Err:    ErrUnsupportedSampling,
+			Detail: fmt.Sprintf("%d color components, want 3 (YCbCr)", len(info.compSamp)),
+		}
+	}
+	for i, s := range info.compSamp {
+		h, v := s[0], s[1]
+		ok := h >= 1 && h <= 2 && v >= 1 && v <= 2
+		if i > 0 {
+			ok = h == 1 && v == 1
+		}
+		if !ok {
+			return &FrameError{
+				Frame: aw.frames,
+				Err:   ErrUnsupportedSampling,
+				Detail: fmt.Sprintf("component %d sampled %dx%d, want luma at most 2x2 and chroma 1x1",
+					i, h, v),
+			}
+		}
+	}
+	return nil
 }
 
 // Close implements AviWriter.Close().
